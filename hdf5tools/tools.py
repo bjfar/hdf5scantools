@@ -11,6 +11,11 @@ import csv
 import os
 import subprocess as sp
 import array
+import re
+import unicodedata
+import operator
+import shlex
+
 from StringIO import StringIO
 
 import matplotlib.pyplot as plt
@@ -37,6 +42,15 @@ mpl.rc('font', **font)
 #mpl.rc('text', usetex=True)
 
 #========Side tools===============================
+#mangle unicode strings into ascii strings
+def unicode2ascii(string):
+    try:
+        outstr = unicodedata.normalize('NFKD', string).encode('ascii','ignore')
+    except TypeError:
+        #If not a unicode string, do nothing.
+        outstr = string       
+    return outstr
+ 
 #extract column from 2D nested list/array
 def column(matrix, i):
     return [row[i] for row in matrix]
@@ -103,6 +117,7 @@ def gettxtheader(fname,txtfile=True):
     header=[]   #initialise list
     #badchars=[' ','(',')',',','-'] #characters to remove
     badchars=[' ','(',')',','] #changed my mind, want to keep '-' character
+    replchars=[('/','|')] #specific replacements to make
     with open(fname, 'r') as f:
         for line in f:
             words=line.split()
@@ -118,6 +133,8 @@ def gettxtheader(fname,txtfile=True):
                     #remove poor formatting
                     for char in badchars:
                         name=name.replace(char, '')
+                    for char,repl in replchars:
+                        name=name.replace(char, repl)
                     header+=[name]
     return header
     
@@ -349,20 +366,38 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
     fid = file(fname,'rb')
 
     #(over)Estimate number of rows from bytecount
-    #---Need to be more careful fo timing file as lines are not all the 
+    #---Need to be more careful of timing file as lines are not all the 
     #same length. Get an average of the first n lines.
-    n = 200
-    p = sp.Popen('head -n {0} {1} | xargs -I LINE expr length "LINE"'.format(n,fname),\
+    n = 2000
+    p = sp.Popen('head -n {0} {1} | xargs -d "\n" -I LINE expr length "LINE"'.format(n,fname),\
         shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
-    rowbytes = np.average(map(int,p.stdout.read().split())) #each 'word' of output is the number of bytes in that line of the file. We get a list of these, turn them into integers, and average them.
-
+    try:
+        rowbytes = np.average(map(int,p.stdout.read().split())) #each 'word' of output is the number of bytes in that line of the file. We get a list of these, turn them into integers, and average them.
+    except ValueError:
+        print "Error reading file! Locating line of error and printing..."
+        # Retry command:
+        p = sp.Popen('head -n {0} {1} | xargs -d "\n" -I LINE expr length "LINE"'.format(n,fname),\
+            shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
+        for i,line in enumerate(p.stdout):
+            try: 
+                map(int,line.split())
+            except ValueError: 
+                print 'Error line: ', line
+                p = sp.Popen('sed -n \'{0}\'p {1}'.format(i+2,fname),\
+                    shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
+                print 'Erronous line of input file: ', \
+                    p.stdout.readline()
+                print 'Possibly a newline is missing, i.e. a line may have been \
+corrupted'
+                break
+        raise
     print "average bytes per row in first {0} rows of file: {1}".format(n,rowbytes)
     p = sp.Popen('ls -l {0}'.format(fname),\
         shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
     totalbytes = int(p.stdout.read().split()[4])   #get the fifth 'word' of the output, which is the total size in bytes of the file
     print "total bytes: ", totalbytes
-    rows = int(np.ceil(totalbytes/rowbytes)) 
-    print "estimates number of rows: ", rows #always seems to overshoot, but that's not a big deal
+    rows = int(np.ceil(totalbytes/rowbytes*1.2))   #multiply by safety factor to make sure output array is big enough 
+    print "estimated number of rows (times 20%): ", rows #always seems to overshoot, but that's not a big deal
 
     #Need to figure out how many total columns there are when everything worked correctly.
     #Do this by finding a row with only numbers in it and counting how many fields it has.
@@ -403,8 +438,11 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
             return float(string)
         except ValueError:
             return -1e300   #the complex numbers in question are likelihood values so set them to the minimum
-
+    
+    allerrors=[]
+    chunknumber = 0
     while 1:
+        chunknumber+=1
         t0 = time.clock()
         chunk = fid.readlines(chunksize)    #need to coordinate chunklines to be larger than the number of rows this produces
         print 'timing 1:', time.clock() - t0
@@ -420,17 +458,146 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
         tmparrerror   = np.array(['']*len(chunk), dtype=('a128'))       #128 string characters is 32 f4's (one byte each character, 4 bytes for one f4)
 
         reader = csv.reader(chunk,delimiter=' ',skipinitialspace=True, quoting=csv.QUOTE_NONNUMERIC, quotechar="'")
- 
-        for i,row in enumerate(reader):
-            if row[-1]=='':         #assume everything is fine if there is no null string in the final field
-                tmparrnumeric[i,:] = row[:-1]
-            else:
-                tmparrnumeric[i,:mincols] = row[:mincols]
-                tmparrerror[i] = row[-1]
+        
+        explen = len(tmparrnumeric[i]) #expected max length of each row
+        errors = []
+        badlinesthischunk = []
+        rowprev = []
+        for i in range(len(chunk)):
+            # Attempt to read next row of chunk
+            errmsg = '' #reset errors for the row
+            try:
+                row = reader.next()
+            except ValueError as err:
+                # Attempt to find out what the problem was
+                raiseflag=True
+                print "ValueError encountered while trying to read row {0} (counting from 1) \
+of database, dumping extra data...".format(i + 1)
+                print "Row {0} of chunk {1}: ".format(i + 1,chunknumber), chunk[i]
+                try:
+                    #Check that shlex can appropriately split the line into
+                    #numeric and string components. Throw out the line if not.
+                    shlex.split(chunk[i])
+                except ValueError as err2:
+                    #Just produce this message always now
+                    #if err2.message=="No closing quotation":
+                    errmsg += "WARNING! Row {0} of the chunk {1} could not \
+be parsed. Please ensure programs in scan are generating valid output. This row\
+ will be omitted from the database.\n".format(i + 1,chunknumber)
+                    raiseflag=False #don't raise error, just skip row
+                                
+                if raiseflag:  #do further checks if row could be split properly
+                    for j,col in enumerate(shlex.split(chunk[i])): #does split preserving quoted substrings
+                        if j!=len(shlex.split(chunk[i]))-1: #skip last element, might be error message (a string)
+                            try: 
+                                float(col)
+                            except ValueError:
+                                raiseflag=False #don't raise error, just skip row
+                                errmsg += "WARNING! Column {0} of row {1} of the chunk {2} contains an \
+invalid float-like string ({3}). Please ensure programs in scan are generating \
+valid output. This row will be omitted from the database.\n".format(j + 1,i + 1,chunknumber,col)
+                
+                if raiseflag: 
+                    # if the source of the error could still not be found, spit
+                    # out a generic error message
+                    errmsg += "WARNING! Unidentified error reading row {0} of \
+the chunk {1}. Please ensure programs in scan are generating valid output. This \
+row will be omitted from the database. Error was: {2} \
+\n".format(i + 1,chunknumber,err.message)
 
+                print errmsg
+                errors += [(errmsg,i)]
+                badlinesthischunk += [i]
+                continue #skip to next row
+            
+            except StopIteration:
+                # When reader.next() reaches the end of the file it raises a
+                # StopIteration error. This is normal and happens for all python
+                # iterations, just that "for" loops and such have the exception
+                # built in. Here we move the iterator manually so we also must
+                # catch the end of the iterator manually.
+                
+                # Ideally the outer for loop iterating through the chunk should
+                # stop us in the right place. Something has gone a bit funny if
+                # we make it to here, so add an error to the list to make a note
+                # of it.
+                errmsg += "WARNING! Unexpectedly reached end of chunk {0} at row\
+ {1}. Skipping to next chunk.\n".format(chunknumber,i + 1)
+                print errmsg
+                errors += [(errmsg,i)]
+                break            
+            #end of try block
+                
+            # Transfer row of chunk to storage arrays
+            try:
+                if len(row)-1>explen:
+                    # This is bad, means the row is *longer* than the .info file
+                    # claims it should be. Means the full observable list was
+                    # not generated during the initialisation of the scan.
+                    # Report this to the user, but load the expected amount of
+                    # data into the hdf5 file anyway.
+                    # Note, row[-1] is some empty field for some reason, if no
+                    # errors were encountered in run
+                    #tmparrnumeric[i,:] = row[:explen]
+                    errmsg = "WARNING! Row {0} of chunk {1} contains more \
+data columns than .info file declares ({2} > {3})! Initialisation phase of scan\
+may have failed to generate the full observable list; i.e. some observables \
+may only be generated rarely. Please check that the scan ran correctly! \
+This row will be omitted from the database.".format(i,chunknumber,len(row),explen)
+                    print errmsg
+                    errors += [(errmsg,i)]
+                    badlinesthischunk += [i]
+                elif row[-1]=='':         #assume everything is fine if there is no null string in the final field
+                    if len(row)-1<explen:
+                        #tmparrnumeric[i,:len(row)-1] = row[:-1]
+                        #tmparrnumeric[i,len(row):] = [0]*(explen-len(row))
+                        errmsg = "WARNING! Row {0} of chunk {1} contains fewer \
+data columns than .info file declares ({2} < {3})! Some scan points may not be \
+generating the full list of observables. Please ensure empty values are set. \
+This row will be omitted from the database.".format(i,chunknumber,len(row),explen)
+                        print errmsg
+                        errors += [(errmsg,i)]
+                        badlinesthischunk += [i]
+                    else:
+                        tmparrnumeric[i,:] = row[:-1]
+                else:
+                    if len(row)<mincols:
+                        errmsg = "WARNING! Row {0} of chunk {1} contains fewer \
+data columns than the minimum expected (minimum produced if errors exist; {2} <\
+ {3}. Please ensure programs in scan are producing valid output. This row will \
+be omitted from the database.".format(i,chunknumber,len(row),mincols)
+                        print errmsg
+                        errors += [(errmsg,i)]
+                        badlinesthischunk += [i]
+                    else:
+                        #everything should be ok!
+                        tmparrnumeric[i,:len(row)-1] = row[:len(row)-1]
+                        tmparrerror[i] = row[-1]
+            except ValueError as err:
+                print "ValueError encountered during database import at row {0}\
+ of chunk, dumping extra data...".format(i)
+                print row
+                print 'row length: ', len(row)
+                print 'expected max length:', len(tmparrnumeric[i])
+                print 'expected min length:', mincols
+                print len(row[:mincols])
+                print len(row)
+                print row[:mincols]
+                raise
+            rowprev = row   #store previous row in case we want to check it in an error situation    
         print 'timing 2:', time.clock() - t0
         t0 = time.clock()
 
+        # Want to delete the rows on which errors occured. It is a bit odd looking
+        # coz I am trying to do it fast, not really sure how successful this
+        # was. This method will suck if there are lots of errors I think.
+        for i in badlinesthischunk:
+            tmparrnumeric[i:-1] = tmparrnumeric[i+1:]
+            tmparrnumeric = tmparrnumeric[:-1]
+            tmparrerror[i:-1] = tmparrerror[i+1:]
+            tmparrerror = tmparrerror[:-1]
+        allerrors += errors #add errors from this chunk to the full list
+        
         #if cols:   #REMOVING COLUMN SELECTION FOR NOW
         #    t0 = time.clock()
         #    tmparr = np.array(list(reader),dtype='<f4')[:,cols]
@@ -448,6 +615,7 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
             #print tmparr.shape[1]
             #print my_dtype
             fpath = h5path+'/{0}'.format(dsetname)
+            print fpath
             try:
                 f.create_group(fpath)   #create a new group to store each dataset (column)
             except ValueError:
@@ -456,7 +624,7 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
             for field,dt in my_dtypelist: 
                 try:
                     dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True)
-                except ValueError:
+                except (ValueError, RuntimeError):
                     if force:
                         #Delete existing dataset and try again
                         del f[fpath][field]
@@ -477,7 +645,7 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
         r0 = r - len(tmparrerror)
         #print r, r0, r - r0, len(tmparrnumeric)
         print 'timing 9:', time.clock() - t0
-        t0 = time.time()
+        t0 = time.clock()
         print "Adding chunk to dataset, rows {0} to {1}".format(r0,r)
         for i,(field,dt) in enumerate(my_dtypelist):
             #print field, i
@@ -490,7 +658,7 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
             else:
                 raise TypeError('Error importing data into hdf5 file, check code! (incorrect dtype)')
         print 'timing 10:', time.clock() - t0
-        t0 = time.time()
+        t0 = time.clock()
         print "Rows imported: {0} of {1}".format(r,rows)
         #check everything worked properly
         #print tmparrnumeric[:10]
@@ -500,10 +668,38 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
     #resize the dataset to delete the unused rows left over due to our over-estimate.
     for field,dt in my_dtypelist:
         dset[field].resize((r,))
+
     print "Unused rows removed. Final dataset shapes: ", [dset[field].shape for field,dt in my_dtypelist]
     del reader
     del chunk
     print 'Elapsed time:', time.clock() - start
+    # Create field to store errors encountered during import
+    if len(allerrors)>0: 
+        errorsQ=True
+        size=len(allerrors)
+        print "WARNING! Problems occurred during dataset import. Messages were \
+as follows:"
+    else: 
+        errorsQ=False
+        size=1
+        allerrors += ['No errors during import! Hurrah!']
+        print allerrors
+    try:
+        dset['importerrors'] = f[fpath].create_dataset('importerrors',(size,)
+                            ,dtype='a256')
+    except (ValueError, RuntimeError):
+        #Delete existing dataset and try again
+        del f[fpath]['importerrors']
+        dset['importerrors'] = f[fpath].create_dataset('importerrors',(size,)
+                            ,dtype='a256')   
+    # Stick import errors into database
+    if errorsQ:
+        for j,(msg,i) in enumerate(allerrors):
+            print msg
+        print "Total number of import errors: ", j+1
+    dset['importerrors'] = np.array(allerrors, dtype=('a256'))
+    print 'To review these errors later please inspect the "importerrors" \
+field of the database'
     return dset
 
 def getdatasetchunks(f,h5path,dsetname,fname,header,cols=None,force=False):
@@ -772,8 +968,20 @@ def getcols(structarr,colnames):
     """
     #Pull columns out one at a time to ensure we get the correct order
     data = np.array([structarr[col] for col in colnames]).transpose()
-    print data.shape
-    dataout = data[~np.isnan(data).any(1)]  #deletes rows containing nans
+    print data.shape, type(data)
+    try:
+        dataout = data[~np.isnan(data).any(1)]  #deletes rows containing nans
+    except TypeError as err:
+        print 'TypeError encountered, dumping extra data...'
+        for i,row in enumerate(data):
+            try:
+                ~np.isnan(row).any(1)
+            except (TypeError,NotImplementedError) as err2:
+                print 'TypeError or NotImplementedError occurred running isnan \
+function on row {0}, dumping row...'.format(i)
+                print row, type(row)
+                raise err2
+            
     print dataout.shape
     print 'NaN count: ',len(data) - len(dataout)
     return dataout
@@ -1084,14 +1292,24 @@ def timehist(times,ax1,ax2=None,labels=None,colors=None):
     if ax2==None: ax2=ax1 
     if colors==None: colors=['blue','red']
     
-    m, M = min(times), max(times)
+    #get min and max times excluding zero and inf (may appear in errornous lines)
+    m, M = min(times[np.nonzero(times)]), max(times[np.isfinite(times)])
+    if m == M:  raise ValueError("Error creating timing histogram! min and max \
+run time are identical ({0} seconds)! Highly unlikely this is valid data") 
     numbins=100.
     w=(M-m)/numbins
     if w<20: w=20   #set minimum bin width to this
     countrange = np.arange(m,M,w)
-    n, bins = np.histogram(times, countrange, normed=True)              #create histogram, normalised to have heights equal to the pdf values (NOT bin probability masses; to get these multiply by w)
-                                                                        #n = bin pdf values
-                                                                        #bins = bin edge values
+    try:
+        n, bins = np.histogram(times, countrange, normed=True)              #create histogram, normalised to have heights equal to the pdf values (NOT bin probability masses; to get these multiply by w)
+    except IndexError:  
+        print "Error creating timing histogram! dumping time data used..."
+        print times[-100:]                                                  #n = bin pdf values
+        print countrange
+        print "min time: ", m
+        print "max time: ", M
+        raise                                                               #bins = bin edge values
+    
     #count up 99% of the probability and neglect bins outside this (shrinks histograms to interesting region)
     totp=0
     for i,p in enumerate(n):
@@ -1542,7 +1760,8 @@ class LinkDataSetForAnalysis():
         """Wrapper for standard "getcols" function, just converted to a method for the analysis object"""
         return getcols(self.dset,colnames) 
     
-    def __init__(self,dsetIN,outdir,allparsIN,likepar=None,probpar=None,effprior=None,timing=False):
+    def __init__(self,dsetIN,outdir,allparsIN,likepar=None,probpar=None,\
+                    effprior=None,timing=False,limitsize=int(1e7),lims=None):
         """Initialise link to dataset, create output directory and check
         that requested data columns are present in dataset. If optional
         arguments are given some extra processing is done.
@@ -1554,6 +1773,10 @@ class LinkDataSetForAnalysis():
         probpar - fieldname of posterior column
         effprior - fieldname of column containing effective log-likelihood
         reweighting factor from effective prior.
+        limitsize - largest number of records allowed, datasets larger than this
+            will be trimmed, preserving the highest likelihood points
+        lims - A list of cuts to make on the dataset, 
+            e.g. lims = [('M0',(0,10000)), ('M12',(0,10000))] #tuple=(min,max)
         """
         allpars = allparsIN[:]                                          #make a copy of the input fieldname list to avoid modifying the user's original list
         
@@ -1561,11 +1784,11 @@ class LinkDataSetForAnalysis():
             os.makedirs(outdir)
         print "Storing plots in {0}...".format(outdir)
         
-        #if timing:
-        #    fieldnames = dsetIN.keys()
-        #else:
-        #    fieldnames = dsetIN.dtype.names
-        fieldnames = dsetIN.dtype.names
+        if timing:
+            fieldnames = dsetIN.keys()
+        else:
+            fieldnames = dsetIN.dtype.names
+
         print fieldnames
         
         if likepar: allpars+=[likepar]
@@ -1594,20 +1817,89 @@ class LinkDataSetForAnalysis():
             print "Fieldnames not found: {0}".format([name for name in allpars if name not in allparsVERIFIED])
         
         #Extract selected columns from hdf5 dataset 
-        """Not sure why I thought timing datasets need different treatment...
+        #Not sure why I thought timing datasets need different treatment...
+        #Ok now I remember, they are actually stored in the hdf5 file differently
+        #to txt: stored with each column as an individual dataset! Need to change
+        #txt datasets to also work this way
+        #-Have just learned that unicode field names cause problems for 
+        #numpy/h5py, so I am adding a new function that mangles the field names 
+        #to ascii (unicode2ascii).
         if timing:
-            newdtype = [(key,dset.dtype) for key,dset in dsetIN.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
-            self.dset = np.zeros(dsetIN[allparsVERIFIED[0]].shape,dtype=newdtype)     #create output structured array
+            likecol = dsetIN[likepar] #actually chi2 values
+            newdtype = [(unicode2ascii(key),dset.dtype) for key,dset in dsetIN.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
+            print newdtype
+            try:
+                #create output structured array
+                # Check if size is within allowed limit   
+                if len(likecol)>limitsize:
+                    print "Warning, database contains more records than allowed by \
+limitsize parameter (size={0}, allowed={1}). Taking only last {1} entries in dataset \
+(as these should have the highest likelihoods on average). 'limitsize' can be set larger in the arguments to LinkDataSetForAnalysis, \
+but this may result in 'array is too big' errors from numpy, depending on the \
+number of fields ('columns') in the dataset".format(len(likecol),limitsize)
+                    #sort by likelihood, preserving original indices so we can
+                    #use them to grab the appropriate rows from the dataset
+                    #!!!!!Sorting is way too slow for large datasets
+                    #print 'Sorting likelihood values...'
+                    #sortedlikes = sorted(enumerate(likecol), \
+                    #                key=operator.itemgetter(1))
+                    #lowest chi2 values first in sorted list
+                    #print 'Generating mask to exclude lowest likelihood values...'
+                    #mask = sortedlikes[:limitsize][:,1] #just grab the list of indices
+                    cut = int(limitsize)
+                else:
+                    #mask = np.array([True]*len(likecol)) #default mask, gets ALL elements of database
+                    cut = len(likecol)
+                self.cut = cut  #need this for histogram creation
+                # If more cuts are asked for by the user then figure them out now
+                datamask = np.array([True]*len(likecol[-cut:]))
+                if lims:
+                    print "Computing requested dataset cuts..."
+                    for field,(cutmin,cutmax) in lims:
+                        datacol = dsetIN[field][-cut:]
+                        #add new cut constraints to the mask
+                        try:
+                            datamask = np.logical_and(datamask, 
+                                np.logical_and(datacol>=cutmin, datacol<=cutmax)
+                                                         )      
+                        except ValueError:
+                            print "Error while computing cuts! Dumping extra \
+output..."
+                            print len(datacol)
+                            print len(datacol>=cutmin)
+                            print len(datacol<=cutmax)
+                            print len(datamask)
+                            print field, cutmin, cutmax 
+                            raise                                               
+                print 'Creating numpy storage space for dataset...'
+                #print likecol[-1000:]
+                self.dset = np.zeros(likecol[-cut:][datamask].shape,dtype=newdtype)
+            except ValueError as err:
+                if err.message=="array is too big.":
+                    print "ERROR! Attempted to create a dataset too large for numpy to \
+handle. Please exclude some fields from the dataset and try again"
+                    print "fields requested:", newdtype
+                    print "number of rows in dataset:", len(dsetIN[allparsVERIFIED[0]])
+                raise            
         else:
-            newdtype = [(key,dt[0]) for key,dt in dsetIN.dtype.fields.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
-            self.dset = np.zeros(dsetIN.shape,dtype=newdtype)     #create output structured array
-        """
-        newdtype = [(key,dt[0]) for key,dt in dsetIN.dtype.fields.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
-        self.dset = np.zeros(dsetIN.shape,dtype=newdtype)     #create output structured array
-        
+            # for 
+            # If more cuts are asked for by the user then figure them out now
+            datamask = np.array([True]*len(likecol[-cut:]))
+            if lims:
+                print "Computing requested dataset cuts..."
+                for field,(cutmin,cutmax) in lims:
+                    datacol = dsetIN[field][-cut:]
+                    #add new cut constraints to the mask
+                    datamask = datacol[np.logical_and(datamask, 
+                        np.logical_and(datacol>=cutmin, datacol<=cutmax)
+                                                        )]
+            newdtype = [(unicode2ascii(key),dt[0]) for key,dt in dsetIN.dtype.fields.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
+            self.dset = np.zeros(dsetIN[-cut:][datamask].shape,dtype=newdtype)     #create output structured array
+
+
         for par in allparsVERIFIED:
             print "Extracting {0} column...".format(par)
-            self.dset[par] = dsetIN[par]       #loop through hdf5 dataset and extract columns into output array 
+            self.dset[par] = dsetIN[par][-cut:][datamask]       #loop through hdf5 dataset and extract columns into output array 
 
         #self.dset = dsetIN[*allparsVERIFIED]
         print "Time taken importing dataset subset: ", time.time() - t0
@@ -1620,8 +1912,8 @@ class LinkDataSetForAnalysis():
         if effprior:
             try:
                 print 'effprior:', effprior
-                print self.dset[effprior]
-                effchi2 = -2 * np.array(self.dset[effprior])    
+                print self.dset[effprior][-cut:][datamask]
+                effchi2 = -2 * np.array(self.dset[effprior][-cut:][datamask])    
                 self.effprior = effchi2.any() #Check if any values for this
                 #column are non-zero. If they are, we used an effective prior for this dataset.
             except ValueError:
@@ -1844,9 +2136,12 @@ class LinkDataSetForAnalysis():
         times = ['looptime','samplertime', 'liketime']
         colorsavail = ['blue','red','green','orange','purple','brown']
         colorslist = zip(colorsavail[:len(times)],colorsavail[:len(times)])
+        
+        print 'Creating program runtime fraction histograms...'
         for name,colors in zip(times,colorslist):
             timehist(self.dset[name],ax,ax1,labels=[name,name+' fraction'],colors=colors)
-            
+        
+        print 'Creating program runtime fraction histograms'    
         progs = [prog for prog in self.dset.dtype.names if 'prog' in prog]
         colorslist = zip(colorsavail[:len(progs)],colorsavail[:len(progs)])
         for prog,colors in zip(progs,colorslist):
