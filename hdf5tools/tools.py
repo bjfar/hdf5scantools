@@ -111,7 +111,7 @@ def gettxtheader(fname,txtfile=True):
     the relevant '.info' file
     Args:
     fname - file to parse
-    txfile - whether or not this is a standard PySUSY '-.txt' file. If
+    txtfile - whether or not this is a standard PySUSY '-.txt' file. If
         True activates special naming conventions for certain columns.
     """
     header=[]   #initialise list
@@ -340,7 +340,7 @@ in 'getdataset' options."
     return dset
 
 
-def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,force=False):
+def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,force=False,timing=True,noerrormsg=False,fastguess=True):
     """Loads the PySUSY timing dataset into a numpy array in chunks
     so we can avoid memory errors, adding each chunk to the specified
     hdf5 dataset as it goes. This is a modified version of 
@@ -368,7 +368,10 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
     #(over)Estimate number of rows from bytecount
     #---Need to be more careful of timing file as lines are not all the 
     #same length. Get an average of the first n lines.
-    n = 2000
+    n = 20000
+    if fastguess:
+       n = 100    
+
     p = sp.Popen('head -n {0} {1} | xargs -d "\n" -I LINE expr length "LINE"'.format(n,fname),\
         shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
     try:
@@ -396,26 +399,45 @@ corrupted'
         shell=True, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, close_fds=True)
     totalbytes = int(p.stdout.read().split()[4])   #get the fifth 'word' of the output, which is the total size in bytes of the file
     print "total bytes: ", totalbytes
-    rows = int(np.ceil(totalbytes/rowbytes*1.2))   #multiply by safety factor to make sure output array is big enough 
-    print "estimated number of rows (times 20%): ", rows #always seems to overshoot, but that's not a big deal
+    rows = int(np.ceil(totalbytes/rowbytes*2))   #multiply by safety factor to make sure output array is big enough 
+    print "estimated number of rows (times 2): ", rows #always seems to overshoot, but that's not a big deal
 
     #Need to figure out how many total columns there are when everything worked correctly.
     #Do this by finding a row with only numbers in it and counting how many fields it has.
     #NOTE: THIS ASSUMES THAT ALL BADMODELPOINTERROR MESSAGES WILL BE STRINGS!
-    notvalid = True
-    loop=0
-    while notvalid:
-        line = fid.readline()
-        try:
-            goodline = map(float, line.split())
-            notvalid = False
-        except ValueError:  #if there is a string in the output we get an error: try next line. 
-            if loop>=100:  #try 100 lines, if no error-free one found then give up.
-                print 'First 100 lines of timing file do not contain a line free of BadModelPointErrors.'
-                raise
+    if not noerrormsg:
+        notvalid = True
+        loop=0
+        while notvalid:
+            line = fid.readline()
+            try:
+                goodline = map(float, line.split())
+                notvalid = False
+            except ValueError:  #if there is a string in the output we get an error: try next line. 
+                if loop>=100:  #try 100 lines, if no error-free one found then give up.
+                    print 'First 100 lines of timing file do not contain a line free of BadModelPointErrors.'
+                    raise
+        totalcols = len(goodline)   #total number of columns in a line of timing output with no errors
+    else:
+        # With no error messages we have to identify bad lines a different way. Measure number of columns in each line; look for largest number of columns and assume these are good points. Not super robust
+        loop=0
+        lines=[]
+        lengths=[]
+        while loop<100:
+           line = fid.readline()
+           try:
+              fline = map(float, line.split())
+              lines += [fline]
+              lengths += [len(fline)]
+           except ValueError:
+              print 'Strings found in output! Please reconsider noerrormsg flag'
+              raise
+           loop+=1
+        maxlength = max(lengths)
+        totalcols = maxlength
+ 
     fid.seek(0) #go back to the beginning of the output file
-    totalcols = len(goodline)   #total number of columns in a line of timing output with no errors
-    
+       
     #CUT OUT THE COLUMN SELECTION FOR NOW, MAKES THINGS TOO COMPLICATED
     #if cols:
     #    my_dtype = np.dtype([(varname,'f') for varname in header[cols]])
@@ -425,9 +447,14 @@ corrupted'
     if extracols<0:
 	raise IOError('Number of columns specified in header file ({0}) is not compatible with the number of columns found in the data file ({1})!!! Implies there are {2} columns of program timing information'.format(len(header),totalcols,extracols))
     fullheader = header + ['prog{0}time'.format(i+1) for i in range(extracols)]
-    my_dtypelist = [(varname,'f4') for varname in fullheader] + [('errors','a128')]   #add an extra column to store the error messages (100 characters only allowed)    
+    my_dtypelist = [(varname,'f4') for varname in fullheader]
+    if timing: my_dtypelist += [('errors','a128')]   #add an extra column to store the error messages (100 characters only allowed)    
     my_dtype = np.dtype(my_dtypelist)
 
+    print "Assigning the following field names to data columns:"
+    for i,name in enumerate(fullheader):
+       print '   ',i+1,':', name
+    
     firstloop=True
     print "Reading original -.timing file into hdf5 dataset...."
     mincols = len(header) - nlogls  #every row should contain at least this many columns of numerical data. Remainder of row is either an error string, or further numerical data.
@@ -459,7 +486,7 @@ corrupted'
 
         reader = csv.reader(chunk,delimiter=' ',skipinitialspace=True, quoting=csv.QUOTE_NONNUMERIC, quotechar="'")
         
-        explen = len(tmparrnumeric[i]) #expected max length of each row
+        explen = len(tmparrnumeric[0]) #expected max length of each row
         errors = []
         badlinesthischunk = []
         rowprev = []
@@ -571,8 +598,11 @@ be omitted from the database.".format(i,chunknumber,len(row),mincols)
                         badlinesthischunk += [i]
                     else:
                         #everything should be ok!
-                        tmparrnumeric[i,:len(row)-1] = row[:len(row)-1]
-                        tmparrerror[i] = row[-1]
+                        if timing:
+                           tmparrnumeric[i,:len(row)-1] = row[:len(row)-1]
+                           tmparrerror[i] = row[-1]
+                        else:
+                           tmparrnumeric[i,:] = row 
             except ValueError as err:
                 print "ValueError encountered during database import at row {0}\
  of chunk, dumping extra data...".format(i)
@@ -594,8 +624,8 @@ be omitted from the database.".format(i,chunknumber,len(row),mincols)
         for i in badlinesthischunk:
             tmparrnumeric[i:-1] = tmparrnumeric[i+1:]
             tmparrnumeric = tmparrnumeric[:-1]
-            tmparrerror[i:-1] = tmparrerror[i+1:]
-            tmparrerror = tmparrerror[:-1]
+            if timing: tmparrerror[i:-1] = tmparrerror[i+1:]
+            if timing: tmparrerror = tmparrerror[:-1]
         allerrors += errors #add errors from this chunk to the full list
         
         #if cols:   #REMOVING COLUMN SELECTION FOR NOW
@@ -633,16 +663,16 @@ be omitted from the database.".format(i,chunknumber,len(row),mincols)
                         dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True)
                     else:
                         print 
-                        print "Error! Dataset {0} already exists! If you wish to overwrite, please set force=True \
-        in 'getdataset' options."
+                        print "Error! Dataset {0} already exists! If you wish \
+to overwrite, please set force=True in 'getdataset' options."
                         print
                         raise
             firstloop=False
             print 'timing 6:', time.clock() - t0
             
         t0 = time.clock()
-        r += len(tmparrerror)
-        r0 = r - len(tmparrerror)
+        r += len(tmparrnumeric)     #len(tmparrerror)
+        r0 = r - len(tmparrnumeric) #r - len(tmparrerror)
         #print r, r0, r - r0, len(tmparrnumeric)
         print 'timing 9:', time.clock() - t0
         t0 = time.clock()
@@ -650,7 +680,7 @@ be omitted from the database.".format(i,chunknumber,len(row),mincols)
         for i,(field,dt) in enumerate(my_dtypelist):
             #print field, i
             if dt=='a128':
-                dset[field][r0:r] = tmparrerror   #error data
+                dset[field][r0:r] = tmparrerror   #error data (will crash if we somehow get here when timing=False, since no tmparrerror array will exist)
             elif dt=='f4':
                 #print tmparrnumeric.shape
                 #print tmparrnumeric[:,i].shape
@@ -775,7 +805,7 @@ def getdatasetchunks(f,h5path,dsetname,fname,header,cols=None,force=False):
                 #print my_dtype
                 dset = f[h5path].create_dataset(dsetname,(rows,),dtype=my_dtype,chunks=True) #(579,tmparr.shape[1]) #Only 1 'column' because each entry has a tuple of 253 elements specified by dtype
                 print 'timing 6:', time.clock() - t0
-            except ValueError:
+            except (ValueError, RuntimeError):
                 if force:
                     #Delete existing dataset and try again
                     del f[h5path][dsetname]
@@ -804,6 +834,8 @@ in 'getdataset' options."
         #The following is a convoluted read/modify/write sequence which turns out to be necessary
         #because full numpy slicing access is not implemented in h5py for structured arrays.
         slice = dset[r0:r]      #extract (empty) slice of dataset
+        print slice.shape
+        print r, r0, r-r0, len(my_dtype)
         sliceview = slice.view('<f4').reshape(r-r0,len(my_dtype))  #create view of structured array so we can access it via slices properly
         print tmparr.shape, sliceview.shape
         sliceview[:] = tmparr   #fill view of slice with our array data
@@ -872,6 +904,80 @@ def getdataset(fname,header,cols=None):
     print 'Elapsed time:', time.clock() - start
 
     return data
+
+def getnotes(f,h5path,fname,force=False):
+    """CURRENTLY ONLY COMPATIBLE WITH TIMING DATASETS
+    Checks the "notes" file produced by pysusy3 to determine which
+    which likelihood components have been folded into the global likelihood, and
+    adds a list of the "unused" components to the specified database
+    f - h5py file object
+    h5path - hdf5 path at which to store dataset
+    fname - path to ascii file containing original dataset notes
+    """
+    # First, read the notes file
+    notesfile = open(fname,'r')
+    # Check that the beginning of the file matches what I currently think it is
+    # supposed to be. If it doesn't, throw an error.
+    tobematched = [
+    'This file records extra notes about the run.\n',
+    '\n',
+    'The following likelihood functions components have NOT been \n',
+    'folded into the scan ("uselike" parameters were set to False). The\n',
+    'computed likelihood values are however supplied in the scan output\n',
+    'for post-scan analysis:\n',
+    '---------------------------------------------------------------------\n'
+    ]
+    for i,line in enumerate(tobematched):
+        curline=notesfile.readline()
+        if line!=curline:
+            print 'Error matching notes file to expected format. On line {0} \
+expected'.format(i)
+            print repr(line)
+            print 'but found'
+            print repr(curline)
+            raise ValueError("WARNING! The 'notes' file associated with this \
+data set does not match the format expected by hdf5scantools. Please check that \
+it has not been corrupted. Also check that hdf5scantools is up-to-date with the \
+latest pysusy/pyscanner version")
+    #If we got through that we should be ready to read the "excluded" logl list
+    endline = '---------------------------------------------------------------------\n'
+    excllogllist = []
+    curline=notesfile.readline()
+    # Added the len(curline) check to make sure we stop if we reach the end of the file first...
+    while curline!=endline and len(curline)!=0:
+        excllogllist+=[curline.rstrip()]    #want to strip trailing newlines and/or whitespace
+        curline=notesfile.readline()
+    # Done! Close notes file
+    notesfile.close()
+    print '"Inactive" likelihoods:', excllogllist
+    
+    try:
+        f.create_group(h5path)   #create a new group to store each dataset (column)
+    except ValueError:
+        pass    #If group already exists we should get a ValueError, but we don't care about that
+    field = 'excl-logl'
+    rows = len(excllogllist)
+    try:
+        str_type = h5py.new_vlen(str)
+        dset = f[h5path].create_dataset(field,(rows,),dtype=str_type)
+    except (ValueError, RuntimeError):
+        if force:
+            #Delete existing dataset and try again
+            del f[h5path][field]
+            t0 = time.clock()
+            print 'creating dataset field {0} (time: {1})'.format(field,time.clock() - t0)
+            dset = f[h5path].create_dataset(field,(rows,),dtype=str_type)
+        else:
+            print 
+            print "Error! Dataset {0} already exists! If you wish \
+to overwrite, please set force=True in 'getdataset' options.".format(field)
+            print
+            raise
+    # Import excluded list into the new dataset
+    for i,loglname in enumerate(excllogllist):
+        dset[i] = loglname
+    print "Inactive likelihood list import (from '.notes') complete. Retrieve \
+list using field '{0}'".format(field)
 
 def write2cols(dataset,data,fieldnames):
         """Currently it is very hard to write to a column in h5py, so
@@ -952,12 +1058,13 @@ cdict4 = {
 margcmap = colors.LinearSegmentedColormap('marg_colormap', cdict4, 1024)
 margconts = [0.68,0.95]
 
-def getcols(structarr,colnames):
+def getcols(structarr,colnames,cleannans=False):
     """"helper function to retrieve a normal, unstructured numpy array from the
     structured array that the dataset returns
     Args
     structarr - result of dset[:], or dset[0:1000] if a subset of rows is desired
     colnames  - list of field names to retrieve from array
+    cleannans - switch to turn on automatic removal of records containing nans.
     """
     """ This way may get the columns switched around!
     #As a bonus, remove NaN's from data
@@ -969,19 +1076,70 @@ def getcols(structarr,colnames):
     #Pull columns out one at a time to ensure we get the correct order
     data = np.array([structarr[col] for col in colnames]).transpose()
     print data.shape, type(data)
-    try:
-        dataout = data[~np.isnan(data).any(1)]  #deletes rows containing nans
-    except TypeError as err:
-        print 'TypeError encountered, dumping extra data...'
-        for i,row in enumerate(data):
-            try:
-                ~np.isnan(row).any(1)
-            except (TypeError,NotImplementedError) as err2:
-                print 'TypeError or NotImplementedError occurred running isnan \
-function on row {0}, dumping row...'.format(i)
-                print row, type(row)
-                raise err2
-            
+    if cleannans:
+        try:
+            dataout = data[~np.isnan(data).any(1)]  #deletes rows containing nans
+        except TypeError as err:
+            print 'TypeError encountered, dumping extra data...'
+            for i,row in enumerate(data):
+                try:
+                    ~np.isnan(row).any(1)
+                except (TypeError,NotImplementedError) as err2:
+                    print 'TypeError or NotImplementedError occurred running \
+isnan function on row {0}, dumping row...'.format(i)
+                    print row, type(row)
+                    raise err2
+        print dataout.shape
+        print 'NaN count: ',len(data) - len(dataout)
+    else:
+        dataout = data
+    return dataout
+    
+def listgetcolsT(structarr,listoflists):
+    """A wrapper for getcols that facilitates use of several parameters lists
+    at once. Note that each element of output is TRANSPOSED relative to
+    standard getcols output"""
+    #Join parameter lists into one big list
+    flatlist = []
+    for listi in listoflists:
+        flatlist+=listi
+    #get those columns from dataset
+    flatout = getcols(structarr,flatlist).T
+    #reshape flatout to match input listoflists and return it
+    shapedout = []
+    i=0
+    for listi in listoflists:
+        iend = i+len(listi)
+        add = flatout[i:iend]
+        shapedout += [ add ]
+        i = iend
+    return shapedout
+
+def getcolsasstruct(structarr,colnames,mask=None):
+    """Does the same as getcols, but retains the structured array format
+    Essentially it's main purpose is to clean out any nan's
+    Args
+    structarr - result of dset[:], or dset[0:1000] if a subset of rows is desired
+    colnames  - list of field names to retrieve from array
+    mask - optional boolean mask; use to remove desired rows (i.e. rows from
+        errornous points) 
+    """
+    if mask!=None:
+        data = structarr[colnames][mask]
+    else:
+        data = structarr[colnames]
+    print data.shape, type(data)
+    
+    # NEED TO ADD SOME ERROR CHECKING
+    
+    # Need to check for nan's field by field, then merge results
+    mask2 = np.ones(len(data))
+    for field,dt in data.dtype.descr:
+        # combine mask of nan points from this field with rest of mask
+        mask2 = np.logical_and(mask2, ~np.isnan(data[field]))
+    
+    # use mask to select only rows without any nans
+    dataout = data[mask2]    
     print dataout.shape
     print 'NaN count: ',len(data) - len(dataout)
     return dataout
@@ -1065,6 +1223,17 @@ def bin1d(data,nbins,binop='min'):
     z = data[:,1]
     return bin2d(np.array(zip(x,y,z)),nbins,1,binop,doconts=False)[0]      #return 1d array of x vs binned values
 
+def bin1dxy(data,nbins,binop='min'):
+    """wrapper for bin1d that returns an array of x,y values, not just the
+    binned y values
+    """
+    x = data[:,0]
+    dx = (max(x)-min(x))/nbins
+    xvals = np.arange(min(x),max(x)-dx/2.,dx)
+    ybinned = bin1d(data,nbins,binop='min')
+    print xvals.shape, ybinned.shape
+    return np.vstack((xvals,ybinned)).T
+    
 def forceAspect(ax,aspect=1):
     extent = ax.get_window_extent().get_points()
     print extent
@@ -1085,7 +1254,7 @@ def forceAspect(ax,aspect=1):
     
 #--------------main plotting routines-----------------------------------
 
-def chi2scatplot(ax,data,title=None,labels=None):
+def chi2scatplot(ax,data,title=None,labels=None,alpha=1.,overlay=False):
     """Creates a scatter plot of the data, colored by Delta chi^2 value
     Args:
     ax - Axis object on which to create plot
@@ -1093,23 +1262,32 @@ def chi2scatplot(ax,data,title=None,labels=None):
         data[:,0] - x data
         data[:,1] - y data
         data[:,2] - chi^2 data
+    alpha - set alpha level
+    noaxes - turn off all axes and decorations (useful for overlays)
     """
     data = data[data[:,2].argsort()[::-1]] #sort points by chi2 (want to plot lowest chi2 points last, achieved by reversing sorted indices via '::-1')
-    plot = ax.scatter(data[:,0],data[:,1],c=np.sqrt(data[:,2]-min(data[:,2])),s=1,lw=0,cmap=chi2cmap, norm=colors.Normalize(vmin=mn,vmax=mx,clip=True))
-    if title: ax.set_title(title)
-    if labels: ax.set_xlabel(labels[0])
-    if labels: ax.set_ylabel(labels[1])
-    ax.set_xlim(min(data[:,0]),max(data[:,0]))
-    ax.set_ylim(min(data[:,1]),max(data[:,1]))
-    ax.grid(True)
+    if overlay==True: lims = ax.axis()
+    plot = ax.scatter(data[:,0],data[:,1],c=np.sqrt(data[:,2]-min(data[:,2])),s=1,lw=0,cmap=chi2cmap, norm=colors.Normalize(vmin=mn,vmax=mx,clip=True),alpha=alpha)
+    if overlay==False:
+       # Skip all this stuff if we are just drawing on extra data
+       if title: ax.set_title(title)
+       if labels: ax.set_xlabel(labels[0])
+       if labels: ax.set_ylabel(labels[1])
+       ax.set_xlim(min(data[:,0]),max(data[:,0]))
+       ax.set_ylim(min(data[:,1]),max(data[:,1]))
+       ax.grid(True)
+    else:
+       ax.axis(lims) #make sure the old limits weren't messed up
+
     return plot
 
-def chi2logscatplot(ax,data,title=None,labels=None):
+def chi2logscatplot(ax,data,title=None,labels=None,logaxis='y'):
     """Creates a scatter plot of the data, colored by Delta chi^2 value
     """
     data = data[data[:,2].argsort()[::-1]] #sort points by chi2 (want to plot lowest chi2 points last, achieved by reversing sorted indices via '::-1')
     plot = ax.scatter(data[:,0],data[:,1],c=np.sqrt(data[:,2]-min(data[:,2])),s=1,lw=0,cmap=chi2cmap, norm=colors.Normalize(vmin=mn,vmax=mx,clip=True))
-    ax.set_yscale('log')
+    if 'x' in logaxis: ax.set_xscale('log')
+    if 'y' in logaxis: ax.set_yscale('log')
     if title: ax.set_title(title)
     if labels: ax.set_xlabel(labels[0])
     if labels: ax.set_ylabel(labels[1])
@@ -1118,13 +1296,10 @@ def chi2logscatplot(ax,data,title=None,labels=None):
     ax.grid(True)
     return plot
     
-def profplot(ax,data,title=None,labels=None):
+def profplot(ax,data,title=None,labels=None,nxbins=np.floor(1.618*100),nybins=100):
     """Creates a binned, profiled plot of the data, colored by Delta chi^2 value,
     i.e. profile likelihood.
     """
-    nxbins=np.floor(1.618*100)
-    nybins=100
-
     x = data[:,0]
     y = data[:,1]
     wx= (max(x)-min(x))/nxbins
@@ -1166,13 +1341,10 @@ def profplot(ax,data,title=None,labels=None):
     
     return im
     
-def margplot(ax,data,title=None,labels=None):
+def margplot(ax,data,title=None,labels=None,nxbins=np.floor(1.618*100),nybins=100):
     """Creates a binned marginalised plot of the data, colored by marginalised posterior
     density.
     """
-    nxbins=np.floor(1.618*100)
-    nybins=100
-
     x = data[:,0]
     y = data[:,1]
     wx= (max(x)-min(x))/nxbins
@@ -1276,6 +1448,59 @@ def margplot1D(ax,data,title=None,labels=None,trim=True):
     
     return im
     """
+
+def make1Dbinplots(axlist,xparlist,xparnames,ctunall,tunall,compardict=None,
+                        nbins=100, binop='min', ymincut=0.1, plotkwargs=None,
+                        ylab=None):
+    """Intended for creation of plots of fine-tuning vs some parameters,
+    but can be used to make any plots of a series of binned 1D data against
+    various parameters.
+    Args:
+    axlist - list of axes to attach plots. Must match len(xparlist)
+    xparlist - list of x data to bin. must match len(axlist), and each
+      element must match len(ctunall[i])
+    xparnames - labels to use for x axes and storage dictionaries
+    ctunall - list of y data vectors to be binned against xpar data
+    tunall - names of y data, for labels and storage dictionaries.
+    
+    Output:
+       plots attached to axes in axlist
+       dictionary containing binned data used for plots, with keys from
+       'tunall' list. 
+       
+    Optional:
+    compardict - dictionary of binned data of the same format as output
+      dictionary. Will be plotted anywhere it matches up with the input
+      parameter names.
+    """
+    if plotkwargs==None: plotkwargs = {}
+    outdict={}
+    for ax,xpar,xparname in zip(axlist,xparlist,xparnames):
+        print 'Generating {0} plots...'.format(xparname)
+        outdict[xparname] = {}
+        for c,lab in zip(ctunall,tunall):
+            print lab, xpar.shape, c.shape
+            minbinnedxy = bin1dxy(np.vstack((xpar,c)).T, nbins, binop)
+            outdict[xparname][lab] = minbinnedxy
+            #skip plot if tuning always low
+            try:
+                compdata = compardict[xparname][lab]
+                if ( max(minbinnedxy[:,1]) < ymincut ) and \
+                   ( max(compdata[:,1]) < ymincut ) :
+                   print 'skipping {0}vs{1} plot...'.format(xparname,lab),max(compdata[:,1]),max(minbinnedxy[:,1]),ymincut
+                   continue
+                ax.plot(*compdata.T, label=lab+'_comp', alpha=0.5, **plotkwargs)
+            except (TypeError,KeyError) as err:
+                if max(minbinnedxy[:,1]) < ymincut: continue
+            ax.plot(*minbinnedxy.T, label=lab, **plotkwargs)
+        leg = ax.legend(fontsize='x-small',ncol=2)
+        try:
+            leg.get_frame().set_alpha(0.5)
+        except AttributeError:
+            pass
+        ax.set_xlabel(xparname)
+        if ylab!=None: ax.set_ylabel(ylab)
+    return outdict
     
 #-------------------timing plots----------------------------------------
 
@@ -1372,7 +1597,7 @@ the path specified.'
     # IMPORT DATASETS
     #=======================================================================
 
-    def importtxtdataset(self,h5path,linuxpath,dt,force=False,chunks=False):
+    def importtxtdataset(self,h5path,linuxpath,dt,force=False,chunks=True,infofile=None,oldstyle=False,notesfile=None,txtfile=True,nonotes=False):
         """import entire '-.txt' files and relevant attributes
         Args:
         h5path      - target path in hdf5 filesystem to store data
@@ -1381,7 +1606,21 @@ the path specified.'
         force       - overwrite existing datasets at h5path
         chunks      - write to hdf5 file in chunks to save memory (slower, and
         seems to result in larger files for some reason (need to fix)).
+        infofile    - override default info file name
+        notesfile   - override default notes file name
+        oldstyle    - add '-.txt' to linuxpath
+        txtfile     - if False, deactivates special names for first two data columns.
+        nonotes     - if True, skips import of notes data (for "plain vanilla" multinest use)
         """
+        if oldstyle==True:
+           filepath = linuxpath+'-.txt'
+        else:
+           filepath = linuxpath
+        if notesfile==None:
+           notesfile= linuxpath+'-.notes'
+        if infofile==None:
+           infofile = linuxpath+'-.info'
+
         f = self.dbase
         #Check that we are in a write mode
         if self.mode!='w' and self.mode!='r+':
@@ -1414,21 +1653,26 @@ Set force=True in 'importdataset' options if you wish to overwrite."
         if doimport:
             print 'Importing "{0}-.txt" into hdf5 system at address "{1}/txt"...'.format(linuxpath,h5path)
             #get header data from .info file (used to name fields of dataset)
-            header = gettxtheader(linuxpath+'-.info')
+            header = gettxtheader(infofile,txtfile=txtfile) #default name
             print header
             #import datasets into filesystem
             if chunks:
-                dset = getdatasetchunks(f,h5path,'txt',linuxpath+'-.txt',header,force=True)
+                #dset = getdatasetchunks(f,h5path,'txt',linuxpath+'-.txt',header,force=True)
+                dset = gettimingdatasetchunks2(f,h5path,'txt',filepath,header,nlogls=len(header),force=True, timing=False)
             else:
-                dset = f[h5path].create_dataset('txt',data=getdataset(linuxpath+'-.txt',header),chunks=True)
+                raise ValueError("Don't use non-chunked data import anymore! I have changed the storage format so that each data column has its own dataset")
+                #dset = f[h5path].create_dataset('txt',data=getdataset(linuxpath+'-.txt',header),chunks=True)
             #set attributes
-            dset.attrs['date_begun'] = dt
-            try:
-                dset.attrs['logZ'] = getevidence(linuxpath+'-stats.dat')
-            except IOError:
-                print linuxpath+'-stats.dat not found. Skipping import of evidence...'
-                #skip importing the evidence if no 'stats.dat' file found
-    
+            ## doesn't work anymore...
+            #dset.attrs['date_begun'] = dt
+            #try:
+            #    dset.attrs['logZ'] = getevidence(linuxpath+'-stats.dat')
+            #except IOError:
+            #    print linuxpath+'-stats.dat not found. Skipping import of evidence...'
+            #    #skip importing the evidence if no 'stats.dat' file found
+            # get list of which log-likelihood components are folded into the global likelihood
+            if not nonotes: getnotes(f,h5path,notesfile,force=True)
+
     def importevdataset(self,h5path,linuxpath,dt,force=False,chunks=False):
         """import entire '-ev.dat' files and relevant attributes. Also imports
         'physlive' file.
@@ -1660,7 +1904,7 @@ in 'getdataset' options."
         
         #done!
 
-    def importtimingdata(self,h5path,linuxpath,dt,force=False,chunks=True):
+    def importtimingdata(self,h5path,linuxpath,dt,force=False,chunks=True,noerrormsg=False,oldstyle=False,infofile=None,notesfile=None,fastguess=False):
         """import contents of '-.timing' file and relevant attributes.
         Args:
         h5path      - target path in hdf5 filesystem to store data
@@ -1670,6 +1914,8 @@ in 'getdataset' options."
         chunks      - write to hdf5 file in chunks to save memory (slower, and
         seems to result in larger files for some reason (need to fix)).
         """
+        if oldstyle: linuxpath+='-.timingCOMB' #backwards compatibility...
+
         f = self.dbase
         #Check that we are in a write mode
         if self.mode!='w' and self.mode!='r+':
@@ -1702,9 +1948,11 @@ Set force=True in 'importdataset' options if you wish to overwrite."
             pass    #If group already exists we should get a ValueError
         
         if doimport:
-            print 'Importing "{0}-.timing" into hdf5 system at address "{1}/timing"...'.format(linuxpath,h5path)
+            print 'Importing "{0}" into hdf5 system at address "{1}/timing"...'.format(linuxpath,h5path)
             #get header data from .info file (used to name fields of dataset)
-            header = gettxtheader(linuxpath+'-.timinginfo', txtfile=False)    #header of '.timing' file
+            if infofile==None:
+                infofile = linuxpath+'-.timinginfo'  #default name
+            header = gettxtheader(infofile, txtfile=False)    #header of '.timing' file
             ntxtcols=len(header)    #get the number of columns in the '-.txt' data
             ncols=ntxtcols+1   #compute the number of columns in the '-phys_live.points' data
             #do some renaming since I gave some columns stupid long descriptions
@@ -1714,19 +1962,116 @@ Set force=True in 'importdataset' options if you wish to overwrite."
             header[ind+1] = 'samplertime'
             header[ind+2] = 'liketime'
             #header=txtheader+['timing']    #build corresponding header
-                
+            
             #import datasets into filesystem
             if chunks:
                 #REPLACED IMPORT SYSTEM! NOW STICKS EACH COLUMN INTO ITS OWN DATASET
-                dset = gettimingdatasetchunks2(f,h5path,'timing',linuxpath+'-.timing',header,nlogls=len(header)-(ind+2),force=True)
+                dset = gettimingdatasetchunks2(f,h5path,'timing',linuxpath,header,nlogls=len(header)-(ind+2),force=True,noerrormsg=noerrormsg,fastguess=fastguess)
             else:
                 raise ValueError('Sorry! Have not written a non-chunked data import function \
 for the timing data! Please set chunks=True in options for importtimingdata function')
                 #dset = f[h5path].create_dataset('live',data=getdataset(linuxpath+'-.timing',header),chunks=True)
             #set attributes
             #f[h5path+'/timing'].attrs['date_begun'] = dt    #DO GROUPS HAVE ATTRIBUTES? CHECK THIS!
-    
-    
+            
+            # Import the list of which logl components are not used (not folded
+            # into the global logl value). Stored in 'notes' dataset at h5path
+            if notesfile==None:
+                notesfile = linuxpath+'-.notes' #default
+            getnotes(f,h5path,notesfile,force=True)
+
+    def shrinksortdset(self,h5path,sortfield,reverse=False,cut=1e6,force=False,chunks=True):
+        """Sort dset according to the specified field and shrink it by taking only
+           the first 'cut' number of entries according to this sort.
+           Sorted and shrunk version of the database to be placed in the hdf5 file
+           at the address <h5path>/shrunk.
+        
+           Arguments:
+           h5path - base location of original datasets
+           sortfield - field on which to base the sorting
+           reverse - (True/False) reverse the default sort order? (default is lowest to highest)
+           cut - number of entries to keep in the final dataset
+               - Special value 'noerrors' gives the database resulting from all errornous points
+                 being removed (there must exist a field called 'errors' containing strings,
+                 where the empty string signals that no errors occurred)
+               - if cut=='None' no cutting occurs.
+           force - overwrite existing dsets in location <h5path>/shrunk
+           chunks - whether to use chunking for the dataset
+        """
+        f = self.dbase
+        #Check that we are in a write mode
+        if self.mode!='w' and self.mode!='r+':
+            print "Error, link to database not opened with write intent! \
+Please reopen link with mode set to 'w' or 'r+'"
+            print "Current mode: {0}".format(self.mode)
+            return 1
+            
+        #Check that original datasets in fact exist
+        try:
+            testlink = f[h5path]
+        except KeyError:
+            raise KeyError('Error shrinking dataset! Original not found (attempted \
+to access at location "{0}"'.format(h5path))
+ 
+        doimport=True
+            
+        #Create group for new dataset if it does not already exist
+        try:
+            f.create_group(h5path+'/shrunk')
+        except ValueError:
+            pass    #If group already exists we should get a ValueError
+        
+        if doimport:
+            print "Shrinking datasets at {0} and sorting by field {1}".format(h5path,sortfield)
+            print "The shrunk dataset with be stored at {0}".format(h5path+'/shrunk')
+            
+            ingroup = f[h5path]
+            outgroup= f[h5path+'/shrunk']         
+
+            # Extract 'sortfield' and do the sorting/cutting
+            print "Sorting by field \"{0}\" (reverse={1})...".format(sortfield,reverse)
+            sortcol = ingroup[sortfield][:] #force copy to numpy array, for fast sorting
+            if reverse: 
+                sortarr = np.argsort(-sortcol)
+            else:
+                sortarr = np.argsort(sortcol)
+            if cut==None:
+                pass
+            elif cut=='noerrors':
+                print "Finding error-free entries..."
+                goodentries = ingroup[errors][:][sortarr] == '' 
+                sortarr = sortarr[goodentries]
+            else:
+                print "Keeping {0} entries".format(cut)
+                sortarr = sortarr[:cut] 
+                        
+            # Loop through the group and created the new shrunk versions                       
+            rows = len(sortarr)
+            print "Final datasets will have {0} entries".format(rows)
+
+            bannedlist = ['shrunk','importerrors']  #fields to ignore
+	    for field,dataset in ingroup.items():
+                if field not in bannedlist:
+                    print "Sorting and shrinking field {0}...".format(field)
+                    print "    ", dataset
+                    dt = dataset.dtype
+                    try:
+                        newdset = outgroup.create_dataset(field,(rows,),dtype=dt,chunks=chunks)
+                    except (ValueError, RuntimeError):
+                        if force:
+                            #Delete existing dataset and try again
+                            del outgroup[field]
+                            newdset = outgroup.create_dataset(field,(rows,),dtype=dt,chunks=chunks)
+                        else:
+                            print 
+                            print "Error! Dataset {0} already exists! If you wish \
+to overwrite, please set force=True in 'getdataset' options.".format(h5path+'/shrunk/'+field)
+                            print
+                            raise
+                    # Copy data to the new field
+                    newdset[:] = dataset[:][sortarr]
+
+            print "Dataset shrink/sort complete!"
     
 #=======================================================================
 # ANALYSIS AUTOMATION TOOLS
@@ -1747,18 +2092,31 @@ class LinkDataSetForAnalysis():
     effprior = False    #flag specifying if CCR prior was used for this dataset
     likepar = None
     probpar = None
+    goodmask = None   #boolean mask identifying points for which no errors occurred 
     
     likedata = None     #global -2*loglikelihood column (potentially reweighted)
     probdata = None     #posterior probability column
     
     #----------Parameters-------------
     plotsize = (8,4)
+    gridplotsize = (10,10)
     
     #------Variables set by addlive-------
        
-    def getcols(self,colnames):
-        """Wrapper for standard "getcols" function, just converted to a method for the analysis object"""
-        return getcols(self.dset,colnames) 
+    def getcols(self,colnames,cleannans=False):
+        """Wrapper for standard "getcols" function, just converted to a method 
+        for the analysis object"""
+        return getcols(self.dset,colnames,cleannans) 
+    
+    def listgetcolsT(self,listcolnames):
+        """Wrapper for standard "listgetcolsT" function, just converted to a method 
+        for the analysis object"""
+        return listgetcolsT(self.dset,listcolnames) 
+    
+    def getcolsasstruct(self,colnames,mask=None):
+        """Wrapper for standard "getcolsasstruct" function, just converted to a 
+        method for the analysis object"""
+        return getcolsasstruct(self.dset,colnames,mask)     
     
     def __init__(self,dsetIN,outdir,allparsIN,likepar=None,probpar=None,\
                     effprior=None,timing=False,limitsize=int(1e7),lims=None):
@@ -1778,12 +2136,19 @@ class LinkDataSetForAnalysis():
         lims - A list of cuts to make on the dataset, 
             e.g. lims = [('M0',(0,10000)), ('M12',(0,10000))] #tuple=(min,max)
         """
-        allpars = allparsIN[:]                                          #make a copy of the input fieldname list to avoid modifying the user's original list
-        
+        #make a copy of the input fieldname list to avoid modifying the user's 
+        #original list
+        allpars = allparsIN[:]  
+          
         if not os.path.exists(outdir):
             os.makedirs(outdir)
         print "Storing plots in {0}...".format(outdir)
-        
+        print "limitsize: ", limitsize
+        try:
+            limitsize = int(limitsize) 
+        except ValueError:
+            limitsize = int(float(limitsize))
+
         if timing:
             fieldnames = dsetIN.keys()
         else:
@@ -1797,6 +2162,8 @@ class LinkDataSetForAnalysis():
         if timing==True:
             allpars+=['looptime','samplertime','liketime']
             allpars+=[prog for prog in fieldnames if 'prog' in prog]
+            if 'errors' in fieldnames:
+                allpars += ['errors']
         allpars=list(set(allpars))  #remove duplicates
         #print 'timing:', timing
         #print 'allpars:', allpars
@@ -1825,18 +2192,19 @@ class LinkDataSetForAnalysis():
         #numpy/h5py, so I am adding a new function that mangles the field names 
         #to ascii (unicode2ascii).
         if timing:
-            likecol = dsetIN[likepar] #actually chi2 values
+            print 'somecol = {0}'.format(allparsVERIFIED[-1])
+            somecol = dsetIN[allparsVERIFIED[0]][:] #unknown column, for length
             newdtype = [(unicode2ascii(key),dset.dtype) for key,dset in dsetIN.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
             print newdtype
             try:
                 #create output structured array
                 # Check if size is within allowed limit   
-                if len(likecol)>limitsize:
+                if len(somecol)>limitsize:
                     print "Warning, database contains more records than allowed by \
-limitsize parameter (size={0}, allowed={1}). Taking only last {1} entries in dataset \
-(as these should have the highest likelihoods on average). 'limitsize' can be set larger in the arguments to LinkDataSetForAnalysis, \
+limitsize parameter (size={0}, allowed={1}). Taking only {1} entries with highest likelihood in dataset. \
+'limitsize' can be set larger in the arguments to LinkDataSetForAnalysis, \
 but this may result in 'array is too big' errors from numpy, depending on the \
-number of fields ('columns') in the dataset".format(len(likecol),limitsize)
+number of fields ('columns') in the dataset".format(len(somecol),limitsize)
                     #sort by likelihood, preserving original indices so we can
                     #use them to grab the appropriate rows from the dataset
                     #!!!!!Sorting is way too slow for large datasets
@@ -1846,17 +2214,68 @@ number of fields ('columns') in the dataset".format(len(likecol),limitsize)
                     #lowest chi2 values first in sorted list
                     #print 'Generating mask to exclude lowest likelihood values...'
                     #mask = sortedlikes[:limitsize][:,1] #just grab the list of indices
+                    ##==============
+                    # Ahh, this is a better way: UPDATE: ok was slow for large datasets, sorting now happens externally
+                    likecol = dsetIN[likepar][:limitsize] #force creation of numpy array, for fast sorting
+                    initmask = np.array([True]*len(likecol))
+                    #initmask = likecol < np.sort(likecol)[limitsize] #mask=True for n (=limitsize) lowest chi2 values
+                    ## Err the below needs bottleneck module which is apparently not standard.
+                    # Aha, doing a partial sort should speed things up:
+                    #datamask = bottleneck.argpartsort(likecol, limitsize) #should get the indices of the lowest n=limitsize chi2 entries
                     cut = int(limitsize)
+                    #cut = len(somecol)
+                    print 'Dataset size after initial reduction: ', np.sum(initmask)
                 else:
-                    #mask = np.array([True]*len(likecol)) #default mask, gets ALL elements of database
-                    cut = len(likecol)
+                    initmask = np.array([True]*len(somecol)) #default mask, gets ALL elements of database
+                    cut = len(somecol)
                 self.cut = cut  #need this for histogram creation
                 # If more cuts are asked for by the user then figure them out now
-                datamask = np.array([True]*len(likecol[-cut:]))
+                #datamask = np.array([True]*len(somecol[-cut:]))
+                datamask = initmask[:]
                 if lims:
+                    initwhere = np.nonzero(initmask)[0] #get indices of True positions
+                    print initwhere
                     print "Computing requested dataset cuts..."
                     for field,(cutmin,cutmax) in lims:
-                        datacol = dsetIN[field][-cut:]
+                        print "Performing cut: {0} <= {1} <= {2}".format(cutmin,field,cutmax) 
+                        try:
+                            datacol = dsetIN[field][:cut][initwhere]
+                            #add new cut constraints to the mask
+                            newmask = (datacol>=cutmin) & (datacol<cutmax)
+                            # Combine this new mask back into the mask on the original large dataset
+                            setFalse = initwhere[~newmask]
+                            datamask[setFalse] = False
+      
+                        except ValueError:
+                            print "Error while computing cuts! Dumping extra output..."
+                            print len(datacol)
+                            print len(datacol>=cutmin)
+                            print len(datacol<=cutmax)
+                            print len(datamask)
+                            print field, cutmin, cutmax 
+                            raise                                               
+                print 'Dataset size after extra cuts imposed: ',np.sum(datamask)
+                print 'Creating numpy storage space for dataset...'
+                #print likecol[-1000:]
+                self.dset = np.zeros(somecol[:cut][datamask].shape,dtype=newdtype)
+            except ValueError as err:
+                if err.message=="array is too big.":
+                    print "ERROR! Attempted to create a dataset too large for numpy to \
+handle. Please exclude some fields from the dataset and try again"
+                    print "fields requested:", newdtype
+                    print "number of rows in dataset:", len(dsetIN[allparsVERIFIED[0]])
+                raise            
+        else:
+            # cuts specfied by "cut" are ignored if not using timing file
+            cut = None
+
+            # If more cuts are asked for by the user then figure them out now
+            somecol = dsetIN[allparsVERIFIED[0]] #some unknown field, for length
+            datamask = np.array([True]*len(somecol))
+            if lims:
+                    print "Computing requested dataset cuts..."
+                    for field,(cutmin,cutmax) in lims:
+                        datacol = dsetIN[field][:]
                         #add new cut constraints to the mask
                         try:
                             datamask = np.logical_and(datamask, 
@@ -1870,36 +2289,14 @@ output..."
                             print len(datacol<=cutmax)
                             print len(datamask)
                             print field, cutmin, cutmax 
-                            raise                                               
-                print 'Creating numpy storage space for dataset...'
-                #print likecol[-1000:]
-                self.dset = np.zeros(likecol[-cut:][datamask].shape,dtype=newdtype)
-            except ValueError as err:
-                if err.message=="array is too big.":
-                    print "ERROR! Attempted to create a dataset too large for numpy to \
-handle. Please exclude some fields from the dataset and try again"
-                    print "fields requested:", newdtype
-                    print "number of rows in dataset:", len(dsetIN[allparsVERIFIED[0]])
-                raise            
-        else:
-            # for 
-            # If more cuts are asked for by the user then figure them out now
-            datamask = np.array([True]*len(likecol[-cut:]))
-            if lims:
-                print "Computing requested dataset cuts..."
-                for field,(cutmin,cutmax) in lims:
-                    datacol = dsetIN[field][-cut:]
-                    #add new cut constraints to the mask
-                    datamask = datacol[np.logical_and(datamask, 
-                        np.logical_and(datacol>=cutmin, datacol<=cutmax)
-                                                        )]
+                            raise   
             newdtype = [(unicode2ascii(key),dt[0]) for key,dt in dsetIN.dtype.fields.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
-            self.dset = np.zeros(dsetIN[-cut:][datamask].shape,dtype=newdtype)     #create output structured array
-
+            self.dset = np.zeros(somecol[datamask].shape,dtype=newdtype)     #create output structured array
 
         for par in allparsVERIFIED:
             print "Extracting {0} column...".format(par)
-            self.dset[par] = dsetIN[par][-cut:][datamask]       #loop through hdf5 dataset and extract columns into output array 
+            self.dset[par] = dsetIN[par][:cut][datamask]       #loop through hdf5 dataset and extract columns into output array 
+            #self.dset[par] = dsetIN[par][:][datamask]       #loop through hdf5 dataset and extract columns into output array 
 
         #self.dset = dsetIN[*allparsVERIFIED]
         print "Time taken importing dataset subset: ", time.time() - t0
@@ -1941,6 +2338,42 @@ handle. Please exclude some fields from the dataset and try again"
             self.probpar = probpar
         self.outdir = outdir
         
+        # Create mask telling us which points had no errors occur
+        if timing and 'errors' in fieldnames:
+            self.goodmask = self.dset['errors'] == ''
+    
+    def applygoodmask(self):
+        """Cut down the imported dataset to only points with no errors"""
+        if self.goodmask==None:
+            print "Warning! No error column found during database import! All \
+points will be assumed to be error-free."
+        else:
+            print "Removing records flagged as errornous from dataset..."
+            self.dset = self.dset[self.goodmask]
+            if self.likedata!=None: self.likedata = self.likedata[self.goodmask]
+            if self.probdata!=None: self.probdata = self.probdata[self.goodmask]
+            self.goodmask = None #No more error rows in dataset!
+
+    def removeallnonfinite(self):
+        """Deletes all records from the dataset in which ANY field contains a
+           non-finite value"""
+        print "Checking dataset for any non-finite values..."
+        fields = self.dset.dtype.names
+        goodmask = np.ones((len(self.dset),), dtype=np.bool) 
+        for field in fields:
+          if field!='errors':
+            badmask = np.logical_not(np.isfinite(self.dset[field]))
+            if np.any(badmask):
+              totbad = np.sum(badmask)
+              print '{0} bad values found in field {1}...'.format(\
+                                                                  totbad,field)
+              goodmask = np.logical_and(goodmask, np.logical_not(badmask))
+        print 'Removed total of {0} records with errornous entries'.format(
+                    len(goodmask)-np.sum(goodmask))
+        self.dset = self.dset[goodmask]
+        if self.likedata!=None: self.likedata = self.likedata[goodmask]
+        if self.probdata!=None: self.probdata = self.probdata[goodmask]
+
     def make2Dscatterplot(self,dataXY,axeslabels,filename,dataL=None):
         """Produce and export a scatter plot of the likelihood
         Args:
@@ -1973,13 +2406,14 @@ handle. Please exclude some fields from the dataset and try again"
         fig.savefig("{0}/{1}-scat.png".format(self.outdir,filename),dpi=(800/8))
         plt.close() #Must do this after EVERY plot!!! Or else memory will leak all over the place!
         
-    def make2Dlogscatterplot(self,dataXY,axeslabels,filename,dataL=None):
+    def make2Dlogscatterplot(self,dataXY,axeslabels,filename,dataL=None,logaxis='y'):
         """Produce and export a scatter plot of the likelihood
         Args:
         dataXY - n*2 array of data to plot, each row is an (x,y) ordinate group
         dataL (optional) - n*1 array of likelihood data. By default is global likelihood.
         axeslabels - list of x,y axis labels
         filename - root name to give output file
+        logaxis - string of axes to make 'log', e.g. 'x' for x axis, 'xy' for both etc.
         """
         if dataL==None: dataL = self.likedata
         # if STILL None throw an error
@@ -1994,7 +2428,7 @@ handle. Please exclude some fields from the dataset and try again"
         #create plot        
         fig= plt.figure(figsize=self.plotsize)
         ax = fig.add_subplot(111)
-        plot = chi2logscatplot(ax,data,labels=axeslabels)
+        plot = chi2logscatplot(ax,data,labels=axeslabels,logaxis=logaxis)
         fig.subplots_adjust(bottom=0.15)
         fig.subplots_adjust(left=0.15)
         fig.subplots_adjust(right=.99)
@@ -2188,7 +2622,300 @@ handle. Please exclude some fields from the dataset and try again"
             dataXY[:,1] = np.exp(dataXY[:,1])   #likelihood
             dataL = -2*self.dset[like]    #Delta chi^2
             self.make2Dscatterplot(dataXY[n:],[obs, like],obs+'likecheck',dataL[n:])
+    
+    def make2Dplotgrid(self,dataALL,axeslabels,filename,dataL=None,
+                        dataP=None,plottype='scatter',colors=None,sortcolors=True,overlay=False,figaxes=None,alphas=1):
+        """Produce and export a grid of scatter plots of the likelihood. This is 
+        a nice way to see many projections of the parameter space on the same
+        plot.
+        Args:
+        dataALL - n*m array of data to plot. Each of n rows is a vector of 
+            length m, containing the various parameter columns to be plotted.
+        axeslabels - list of axis labels corresponding to order of parameters in
+            columns of 'data'.
+        filename - root name to give output file
+        dataL (optional) - n*1 array of likelihood data. By default is global 
+            likelihood.
+        dataP (optional) - n*1 array of posterior mass data. By default is 
+            original scan posterior.
+        plottype (optional) - which sort of plot to put in the grid. Current 
+            valid options are: 'scatter', 'profile', 'posterior'. Default is
+            'scatter'.
+            NEW: new plottype 'customcolors' available. Must supply a vector
+            of colours to use of length n in 'colors'
+        """
+        if plottype=='scatter' or plottype=='profile':
+            if dataL==None: dataL = self.likedata
+            # if STILL None throw an error
+            if dataL==None: 
+                raise ValueError('No default -2*loglikelihood column specified \
+and none supplied!')
+        elif plottype=='posterior':   
+            if dataP==None: dataP = self.probdata
+            # if STILL None throw an error
+            if dataP==None: 
+                raise ValueError('No default posterior column specified and \
+none supplied!')
+        elif plottype=='customcolors':
+            if colors==None:
+                raise ValueError('To use plottype "customcolors" please supply a \
+2D array of RBG values (i.e. n*3 array) in the argument "colors"')
+        else:
+            raise ValueError("Invalid value provide for plottype \
+option. Currently valid values are 'scatter', 'profile' or 'posterior' (got \
+'{0}')".format(plottype))
+                
+        n = len(axeslabels)
+        if n!=len(dataALL[0,:]):
+            raise ValueError('Length of axes labels list does not match number \
+of data columns supplied!')
+   
+        #create plot        
+        #fig= plt.figure(figsize=self.gridplotsize)
+                
+        # Need to cycle through the various combinations of pairs of parameters,
+        # and produce a scatter plot for each of them.
+        if figaxes==None: 
+           fig,axes = plt.subplots(n-1,n-1,figsize=self.gridplotsize)
+           for ax in axes.flatten():
+              ax.axis('off')
+        else:
+           fig,axes = figaxes
 
+        for j in range(1,n):
+            for i in range(0,j):
+                #print i,j,i+(n-1)*(j-1)
+                print axeslabels[i],axeslabels[j]
+                #stitch together XY data and likelihood(chi2) (or post.) column
+                data = np.zeros((len(dataALL),3))
+                data[:,:2] = dataALL[:,[i,j]]
+
+                #create plot        
+                #ax = fig.add_subplot(n-1,n-1,(i+1)+(n-1)*(j-1))
+                ax = axes[j-1,i]
+                ax.axis('on')
+                ax.margins(0,0)
+
+                if plottype=='scatter':
+                    data[:,2] = dataL
+                    plot = chi2scatplot(ax,data,labels=[axeslabels[i],axeslabels[j]],overlay=overlay)
+                elif plottype=='profile':
+                    data[:,2] = dataL
+                    plot = profplot(ax,data,labels=[axeslabels[i],axeslabels[j]],
+                                        nxbins=75,nybins=75)
+                elif plottype=='posterior':
+                    data[:,2] = dataP                                   
+                    plot = margplot(ax,data,labels=[axeslabels[i],axeslabels[j]],
+                                        nxbins=75,nybins=75)
+                elif plottype=='customcolors':
+                    if sortcolors:
+                       #draw the higher likelihood points on top
+                       sorti=np.argsort(dataL)[::-1]
+                       # No alpha argument allowed: alpha channel should be part of 'colors' array if you want it.
+                       plot = ax.scatter(data[sorti,0],data[sorti,1],s=1,lw=0,c=colors[sorti])     
+                    else:
+                       # Shuffle the data and color arrays in sync, so that we
+                       # don't bias the order the points are drawn by the plotter.
+                       rng_state = np.random.get_state()
+                       np.random.shuffle(data)
+                       np.random.set_state(rng_state)
+                       np.random.shuffle(colors)
+                       plot = ax.scatter(data[:,0],data[:,1],s=1,lw=0,c=colors,alpha=alphas)
+                    if not overlay: ax.set_xlabel(axeslabels[i])
+                    if not overlay: ax.set_ylabel(axeslabels[j])
+                else:
+                    raise ValueError("Invalid value provide for plottype \
+option. Currently valid values are 'scatter', 'profile' or 'posterior' (got \
+'{0}')".format(plottype))
+                
+                if not overlay:
+                   #cut off tick labels that overlap between subplots
+                   nxbins = len(ax.get_xticklabels())
+                   nybins = len(ax.get_yticklabels())
+                   ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=nxbins, prune='upper'))
+                   ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=nybins, prune='upper'))
+                   
+                   #rotate x-tick labels so we can read them...
+                   labels = ax.get_xticklabels() 
+                   for label in labels: 
+                       label.set_rotation(-90)
+    
+                   #remove the tick and axis labels from 'interior' plots
+                   if j<(n-1): 
+                       ax.set_xticklabels([])
+                       ax.set_xlabel('')
+                   if i>0: 
+                       ax.set_yticklabels([])
+                       ax.set_ylabel('')
+                   
+                """
+                fig.subplots_adjust(bottom=0.15)
+                fig.subplots_adjust(left=0.15)
+                fig.subplots_adjust(right=.99)
+                
+                cax,kw = colorbar.make_axes(ax, orientation='vertical', shrink=0.7, pad=0.04)
+                cbar = fig.colorbar(plot, ax=ax, cax=cax, ticks=[0, 1, 2, 3, 4, 5], **kw)
+                cbar.ax.set_yticklabels(['0','1','4','9','16',r'$\geq$25'])# vertically oriented colorbar
+                cbar.ax.set_title("$\Delta\chi^2$")
+                """   
+        
+        plt.tight_layout()
+        
+        # Cut out space between subplots
+        fig.subplots_adjust(wspace=0,hspace=0)
+   
+        # Save the plots
+        #fig.savefig("{0}/{1}-grid{2}.png".format(self.outdir,filename,plottype),dpi=(800/8))
+        #plt.close() #Must do this after EVERY plot!!! Or else memory will leak all over the place!
+
+        return fig,axes
+        
+ 
+# Generalisation of make2Dplotgrid, to accept seperate lists for X and Y parameters to plot.
+    def make2DplotgridXY(self,(dataX,dataY),(axeslabelsX,axeslabelsY),filename,dataL=None,
+                        dataP=None,plottype='scatter',colors=None,sortcolors=True):
+        """Produce and export a grid of scatter plots of the likelihood. This is 
+        a nice way to see many projections of the parameter space on the same
+        plot.
+        Args:
+
+        dataX - n*nX array of data to plot. Each of n rows is a vector of 
+            length nX, containing the various parameter columns to be plotted.
+        dataY - n*nY array of data to plot. Each of n rows is a vector of 
+            length nY, containing the various parameter columns to be plotted.
+
+        axeslabelsX - list of axis labels corresponding to order of parameters in
+            columns of 'dataX'.
+        axeslabelsY - list of axis labels corresponding to order of parameters in
+            columns of 'dataY'. 
+
+        filename - root name to give output file
+        dataL (optional) - n*1 array of likelihood data. By default is global 
+            likelihood.
+        dataP (optional) - n*1 array of posterior mass data. By default is 
+            original scan posterior.
+        plottype (optional) - which sort of plot to put in the grid. Current 
+            valid options are: 'scatter', 'profile', 'posterior'. Default is
+            'scatter'.
+            NEW: new plottype 'customcolors' available. Must supply a vector
+            of colours to use of length n in 'colors'
+        """
+        if plottype=='scatter' or plottype=='profile':
+            if dataL==None: dataL = self.likedata
+            # if STILL None throw an error
+            if dataL==None: 
+                raise ValueError('No default -2*loglikelihood column specified \
+and none supplied!')
+        elif plottype=='posterior':   
+            if dataP==None: dataP = self.probdata
+            # if STILL None throw an error
+            if dataP==None: 
+                raise ValueError('No default posterior column specified and \
+none supplied!')
+        elif plottype=='customcolors':
+            if colors==None:
+                raise ValueError('To use plottype "customcolors" please supply a \
+2D array of RBG values (i.e. n*3 array) in the argument "colors"')
+        else:
+            raise ValueError("Invalid value provide for plottype \
+option. Currently valid values are 'scatter', 'profile' or 'posterior' (got \
+'{0}')".format(plottype))
+                
+        nX = len(axeslabelsX)
+        if nX!=len(dataX[0,:]):
+            raise ValueError('Length of X axes labels list does not match number \
+of X data columns supplied!')
+  
+        nY = len(axeslabelsY)
+        if nY!=len(dataY[0,:]):
+            raise ValueError('Length of Y axes labels list does not match number \
+of Y data columns supplied!')
+   
+        #create plot        
+        fig= plt.figure(figsize=self.gridplotsize)
+                
+        # Need to cycle through the various combinations of pairs of parameters,
+        # and produce a scatter plot for each of them.
+        for j in range(0,nY):
+            for i in range(0,nX):
+                #print i,j,i+(n-1)*(j-1)
+                print axeslabelsX[i],axeslabelsY[j]
+                #stitch together XY data and likelihood(chi2) (or post.) column
+                data = np.zeros((len(dataX),3)) #should check len(dataX)=len(dataY)...
+                data[:,0] = dataX[:,i]
+                data[:,1] = dataY[:,j]  
+
+                #create plot       
+                print 'plot number', (i+1)+nX*j 
+                ax = fig.add_subplot(nY,nX,(i+1)+nX*j)
+                if plottype=='scatter':
+                    data[:,2] = dataL
+                    plot = chi2scatplot(ax,data,labels=[axeslabelsX[i],axeslabelsY[j]])
+                elif plottype=='profile':
+                    data[:,2] = dataL
+                    plot = profplot(ax,data,labels=[axeslabelsX[i],axeslabelsY[j]],
+                                        nxbins=75,nybins=75)
+                elif plottype=='posterior':
+                    data[:,2] = dataP                                   
+                    plot = margplot(ax,data,labels=[axeslabelsX[i],axeslabelsY[j]],
+                                        nxbins=75,nybins=75)
+                elif plottype=='customcolors':
+                    if sortcolors:
+                       #draw the higher likelihood points on top
+                       sorti=np.argsort(dataL)[::-1]
+                       plot = ax.scatter(data[sorti,0],data[sorti,1],s=1,lw=0,c=colors[sorti],alpha=0.6)     
+                    else:
+                       # Shuffle the data and color arrays in sync, so that we
+                       # don't bias the order the points are drawn by the plotter.
+                       rng_state = np.random.get_state()
+                       np.random.shuffle(data)
+                       np.random.set_state(rng_state)
+                       np.random.shuffle(colors)
+                       plot = ax.scatter(data[:,0],data[:,1],s=1,lw=0,c=colors,alpha=0.6)
+                else:
+                    raise ValueError("Invalid value provide for plottype \
+option. Currently valid values are 'scatter', 'profile' or 'posterior' (got \
+'{0}')".format(plottype))
+                
+                #cut off tick labels that overlap between subplots
+                nxbins = len(ax.get_xticklabels())
+                nybins = len(ax.get_yticklabels())
+                ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=nxbins, prune='upper'))
+                ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=nybins, prune='upper'))
+                
+                #rotate x-tick labels so we can read them...
+                labels = ax.get_xticklabels() 
+                for label in labels: 
+                    label.set_rotation(-90)
+    
+                #remove the tick and axis labels from 'interior' plots
+                print i,nX, j, nY
+                if j<(nY-1): 
+                    ax.set_xticklabels([])
+                    ax.set_xlabel('')
+                if i>0: 
+                    ax.set_yticklabels([])
+                    ax.set_ylabel('')
+                
+                """
+                fig.subplots_adjust(bottom=0.15)
+                fig.subplots_adjust(left=0.15)
+                fig.subplots_adjust(right=.99)
+                
+                cax,kw = colorbar.make_axes(ax, orientation='vertical', shrink=0.7, pad=0.04)
+                cbar = fig.colorbar(plot, ax=ax, cax=cax, ticks=[0, 1, 2, 3, 4, 5], **kw)
+                cbar.ax.set_yticklabels(['0','1','4','9','16',r'$\geq$25'])# vertically oriented colorbar
+                cbar.ax.set_title("$\Delta\chi^2$")
+                """   
+        
+        plt.tight_layout()
+        
+        # Cut out space between subplots
+        fig.subplots_adjust(wspace=0,hspace=0)
+   
+        # Save the plot
+        fig.savefig("{0}/{1}-grid{2}.png".format(self.outdir,filename,plottype),dpi=(800/8))
+        plt.close() #Must do this after EVERY plot!!! Or else memory will leak all over the place!
 
 #Modified version of dataset analysis class for dealing with ev.dat and live point files
 #(combines into one dataset of same form as .txt dataset)
