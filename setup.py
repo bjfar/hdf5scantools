@@ -7,7 +7,7 @@ setup(
     author_email='ben.farmer@gmail.com',
     packages=['hdf5tools'],
     scripts=['bin/addtohdf5_xe15k.py','bin/evidence.py','bin/newevidences.py',\
-'bin/quickinfo.py','bin/reweight.py','bin/summary.py','bin/treehdf5.py'],
+'bin/quickinfo.py','bin/reweight.py','bin/summary.py','bin/treehdf5'],
     url='http://pypi.python.org/pypi/hdf5tools/', #not really, just an example
     license='LICENSE.txt',
     description='A collection of analysis tools for performing Bayesian model \

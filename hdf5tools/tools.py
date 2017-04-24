@@ -340,7 +340,7 @@ in 'getdataset' options."
     return dset
 
 
-def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,force=False,timing=True,noerrormsg=False,fastguess=True):
+def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,force=False,timing=True,noerrormsg=False,fastguess=True,append=False):
     """Loads the PySUSY timing dataset into a numpy array in chunks
     so we can avoid memory errors, adding each chunk to the specified
     hdf5 dataset as it goes. This is a modified version of 
@@ -360,6 +360,7 @@ def gettimingdatasetchunks2(f,h5path,dsetname,fname,header,nlogls,cols=None,forc
     """
     start = time.clock()
     arrlist = None
+    rinit = 0
     r = 0
     chunksize = 4096 * 10000 # seems to be good
  
@@ -641,26 +642,39 @@ be omitted from the database.".format(i,chunknumber,len(row),mincols)
             print 'firstloop!'
             #Create output hdf5 dataset using my_dtype created from header to name fields
             t0 = time.clock()
-            print 'making dataset 0'
             #print tmparr.shape[1]
             #print my_dtype
             fpath = h5path+'/{0}'.format(dsetname)
             print fpath
             try:
                 f.create_group(fpath)   #create a new group to store each dataset (column)
+                print 'Created group {0}'.format(fpath)
             except ValueError:
                 pass    #If group already exists we should get a ValueError, but we don't care about that
             dset = {}
             for field,dt in my_dtypelist: 
                 try:
-                    dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True)
+                    dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True,maxshape=(None,))
+                    print 'Created dataset {0}'.format(field)
                 except (ValueError, RuntimeError):
                     if force:
-                        #Delete existing dataset and try again
-                        del f[fpath][field]
-                        t0 = time.clock()
-                        print 'creating dataset field {0} (time: {1})'.format(field,time.clock() - t0)
-                        dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True)
+                        if append:
+                            print 'Opening {0} for appending'.format(fpath)
+                            # Open existing dataset for append
+                            dset[field] = f[fpath][field]
+                            # Get current size
+                            rinit = len(dset[field])
+                            r = rinit
+                            # Extend dataset by expected amount of rows
+                            dset[field].resize((rinit+rows,))
+                            print 'Old size was {0}; extending to {1} to accommodate estimated new data'.format(rinit,rinit+rows)
+                        else:
+                            #Delete existing dataset and try again
+                            del f[fpath][field]
+                            #t0 = time.clock()
+                            #print 'creating dataset field {0} (time: {1})'.format(field,time.clock() - t0)
+                            print 'Deleted old dataset and creating new one of {0}'.format(field)
+                            dset[field] = f[fpath].create_dataset(field,(rows,),dtype=dt,chunks=True)
                     else:
                         print 
                         print "Error! Dataset {0} already exists! If you wish \
@@ -689,7 +703,7 @@ to overwrite, please set force=True in 'getdataset' options."
                 raise TypeError('Error importing data into hdf5 file, check code! (incorrect dtype)')
         print 'timing 10:', time.clock() - t0
         t0 = time.clock()
-        print "Rows imported: {0} of {1}".format(r,rows)
+        print "Rows imported: {0} of {1}".format(r-rinit,rows)
         #check everything worked properly
         #print tmparrnumeric[:10]
         #print tmparrerror[:10]
@@ -1658,7 +1672,7 @@ Set force=True in 'importdataset' options if you wish to overwrite."
             #import datasets into filesystem
             if chunks:
                 #dset = getdatasetchunks(f,h5path,'txt',linuxpath+'-.txt',header,force=True)
-                dset = gettimingdatasetchunks2(f,h5path,'txt',filepath,header,nlogls=len(header),force=True, timing=False)
+                dset = gettimingdatasetchunks2(f,h5path,'txt',filepath,header,nlogls=len(header),force=True, timing=False, append=False)
             else:
                 raise ValueError("Don't use non-chunked data import anymore! I have changed the storage format so that each data column has its own dataset")
                 #dset = f[h5path].create_dataset('txt',data=getdataset(linuxpath+'-.txt',header),chunks=True)
@@ -1904,7 +1918,7 @@ in 'getdataset' options."
         
         #done!
 
-    def importtimingdata(self,h5path,linuxpath,dt,force=False,chunks=True,noerrormsg=False,oldstyle=False,infofile=None,notesfile=None,fastguess=False):
+    def importtimingdata(self,h5path,linuxpath,dt,force=False,chunks=True,noerrormsg=False,oldstyle=False,infofile=None,notesfile=None,fastguess=False,header=None,append=False):
         """import contents of '-.timing' file and relevant attributes.
         Args:
         h5path      - target path in hdf5 filesystem to store data
@@ -1913,6 +1927,7 @@ in 'getdataset' options."
         force       - overwrite existing datasets at h5path
         chunks      - write to hdf5 file in chunks to save memory (slower, and
         seems to result in larger files for some reason (need to fix)).
+        append      - if True, adds data to existing hdf5 dataset rather than replacing it
         """
         if oldstyle: linuxpath+='-.timingCOMB' #backwards compatibility...
 
@@ -1951,22 +1966,26 @@ Set force=True in 'importdataset' options if you wish to overwrite."
             print 'Importing "{0}" into hdf5 system at address "{1}/timing"...'.format(linuxpath,h5path)
             #get header data from .info file (used to name fields of dataset)
             if infofile==None:
-                infofile = linuxpath+'-.timinginfo'  #default name
-            header = gettxtheader(infofile, txtfile=False)    #header of '.timing' file
-            ntxtcols=len(header)    #get the number of columns in the '-.txt' data
-            ncols=ntxtcols+1   #compute the number of columns in the '-phys_live.points' data
-            #do some renaming since I gave some columns stupid long descriptions
-            header[0] = 'neg2LogL'
-            ind = header.index('Totaltimeofloop')  #need to find this because don't know how many parameter columns there are. Name has spaces removed by gettxtheader.
-            header[ind] = 'looptime'
-            header[ind+1] = 'samplertime'
-            header[ind+2] = 'liketime'
-            #header=txtheader+['timing']    #build corresponding header
+               # use user-supplied 'header' list
+               if header==None:
+                  raise ValueError("No .info file supplied, nor a manual 'header' list!")
+            else:
+               header = gettxtheader(infofile, txtfile=False)    #header of '.timing' file
+               ntxtcols=len(header)    #get the number of columns in the '-.txt' data
+               ncols=ntxtcols+1   #compute the number of columns in the '-phys_live.points' data
+               #do some renaming since I gave some columns stupid long descriptions
+               header[0] = 'neg2LogL'
+               ind = header.index('Totaltimeofloop')  #need to find this because don't know how many parameter columns there are. Name has spaces removed by gettxtheader.
+               header[ind] = 'looptime'
+               header[ind+1] = 'samplertime'
+               header[ind+2] = 'liketime'
+               #header=txtheader+['timing']    #build corresponding header
             
             #import datasets into filesystem
             if chunks:
                 #REPLACED IMPORT SYSTEM! NOW STICKS EACH COLUMN INTO ITS OWN DATASET
-                dset = gettimingdatasetchunks2(f,h5path,'timing',linuxpath,header,nlogls=len(header)-(ind+2),force=True,noerrormsg=noerrormsg,fastguess=fastguess)
+                nlogls=0 # was len(header)-(ind+2)
+                dset = gettimingdatasetchunks2(f,h5path,'timing',linuxpath,header,nlogls=nlogls,force=True,noerrormsg=noerrormsg,fastguess=fastguess,append=append)
             else:
                 raise ValueError('Sorry! Have not written a non-chunked data import function \
 for the timing data! Please set chunks=True in options for importtimingdata function')
@@ -1976,9 +1995,10 @@ for the timing data! Please set chunks=True in options for importtimingdata func
             
             # Import the list of which logl components are not used (not folded
             # into the global logl value). Stored in 'notes' dataset at h5path
-            if notesfile==None:
-                notesfile = linuxpath+'-.notes' #default
-            getnotes(f,h5path,notesfile,force=True)
+            # DISABLED!
+            #if notesfile==None:
+                #notesfile = linuxpath+'-.notes' #default
+            #getnotes(f,h5path,notesfile,force=True)
 
     def shrinksortdset(self,h5path,sortfield,reverse=False,cut=1e6,force=False,chunks=True):
         """Sort dset according to the specified field and shrink it by taking only
