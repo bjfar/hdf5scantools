@@ -300,7 +300,7 @@ def forceAspect(ax,aspect=1):
     
 #--------------main plotting routines-----------------------------------
 
-def chi2scatplot(ax,data,title=None,labels=None,alpha=1.,overlay=False):
+def chi2scatplot(ax,data,title=None,labels=None,alpha=1.,overlay=False,s=1):
     """Creates a scatter plot of the data, colored by Delta chi^2 value
     Args:
     ax - Axis object on which to create plot
@@ -309,11 +309,12 @@ def chi2scatplot(ax,data,title=None,labels=None,alpha=1.,overlay=False):
         data[:,1] - y data
         data[:,2] - chi^2 data
     alpha - set alpha level
+    s - marker size
     noaxes - turn off all axes and decorations (useful for overlays)
     """
     data = data[data[:,2].argsort()[::-1]] #sort points by chi2 (want to plot lowest chi2 points last, achieved by reversing sorted indices via '::-1')
     if overlay==True: lims = ax.axis()
-    plot = ax.scatter(data[:,0],data[:,1],c=np.sqrt(data[:,2]-min(data[:,2])),s=1,lw=0,cmap=chi2cmap, norm=colors.Normalize(vmin=mn,vmax=mx,clip=True),alpha=alpha)
+    plot = ax.scatter(data[:,0],data[:,1],c=np.sqrt(data[:,2]-min(data[:,2])),s=s,lw=0,cmap=chi2cmap, norm=colors.Normalize(vmin=mn,vmax=mx,clip=True),alpha=alpha)
     if overlay==False:
        # Skip all this stuff if we are just drawing on extra data
        if title: ax.set_title(title)
