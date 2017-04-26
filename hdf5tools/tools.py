@@ -8,11 +8,10 @@ import numpy as np
 import os
 import array
 import re
-import unicodedata
 import operator
 import shlex
 
-import import_tools #my hdf5 import tools
+from hdf5tools.import_tools import * #my hdf5 import tools
 
 from StringIO import StringIO
 
@@ -28,8 +27,10 @@ import scipy.stats as sps
 from itertools import groupby
 from operator import itemgetter
 
-import uncertainties as un
-from uncertainties.umath import exp as uexp
+import time 
+
+#import uncertainties as un
+#from uncertainties.umath import exp as uexp
 
 #global options that may be desired to be tweaked
 font = {'family' : 'serif',
@@ -634,7 +635,7 @@ class LinkDataSetForAnalysis():
     
     #----------Parameters-------------
     plotsize = (8,4)
-    gridplotsize = (10,10)
+    gridplotsize = (20,20)
     
     #------Variables set by addlive-------
        
@@ -728,7 +729,8 @@ class LinkDataSetForAnalysis():
         #to ascii (unicode2ascii).
         if timing:
             print 'somecol = {0}'.format(allparsVERIFIED[-1])
-            somecol = dsetIN[allparsVERIFIED[0]][:] #unknown column, for length
+            somecol = dsetIN[allparsVERIFIED[0]] #unknown column, for length
+            print 'length of verified data:', len(somecol)
             newdtype = [(unicode2ascii(key),dset.dtype) for key,dset in dsetIN.items() if key in allparsVERIFIED]       #get the dtypes for the chosen columns 
             print newdtype
             try:
@@ -876,7 +878,10 @@ output..."
         # Create mask telling us which points had no errors occur
         if timing and 'errors' in fieldnames:
             self.goodmask = self.dset['errors'] == ''
-    
+            if np.sum(self.goodmask)==0:
+                print '"errors" dataset appears to mark every point as bad. Will assume that this is not correct (perhaps import not done quite correctly) and ignore this dataset'
+                self.goodmask = None   
+ 
     def applygoodmask(self):
         """Cut down the imported dataset to only points with no errors"""
         if self.goodmask==None:
@@ -884,6 +889,8 @@ output..."
 points will be assumed to be error-free."
         else:
             print "Removing records flagged as errornous from dataset..."
+            if np.sum(self.goodmask)==0:
+               raise ValueError("No good points left after application of mask! Nothing left to plot!")
             self.dset = self.dset[self.goodmask]
             if self.likedata!=None: self.likedata = self.likedata[self.goodmask]
             if self.probdata!=None: self.probdata = self.probdata[self.goodmask]

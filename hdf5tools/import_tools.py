@@ -5,6 +5,7 @@ import csv
 import h5py
 import time
 import subprocess as sp
+import unicodedata
 
 #========Side tools===============================
 #mangle unicode strings into ascii strings
