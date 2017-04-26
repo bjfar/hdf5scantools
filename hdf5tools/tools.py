@@ -654,7 +654,7 @@ class LinkDataSetForAnalysis():
         method for the analysis object"""
         return getcolsasstruct(self.dset,colnames,mask)     
     
-    def __init__(self,dsetIN,outdir,allparsIN,likepar=None,probpar=None,\
+    def __init__(self,dsetIN,outdir,allparsIN,likepar=None,neg2logl=True,probpar=None,\
                     effprior=None,timing=False,limitsize=int(1e7),lims=None):
         """Initialise link to dataset, create output directory and check
         that requested data columns are present in dataset. If optional
@@ -664,6 +664,7 @@ class LinkDataSetForAnalysis():
         outdir - Path to directory to store results
         allparsIN - list of fieldnames of columns to to be extracted from dsetIN
         likepar - fieldname of -2*loglikelihood column
+        neg2logl - (True/False); if False, treats 'likepar' as log-likelihood rather than -2*log-likelihood
         probpar - fieldname of posterior column
         effprior - fieldname of column containing effective log-likelihood
         reweighting factor from effective prior.
@@ -865,8 +866,12 @@ output..."
         #Get -2*likelihood column and posterior column
         t0 = time.time() 
        
-        if likepar: 
-            self.likedata = np.array(self.dset[likepar]) - effchi2
+        if likepar:
+            if neg2logl==True:
+               self.likedata = np.array(self.dset[likepar]) - effchi2
+            else:
+               # Assume likepar is log-likelihood, not -2*loglikelihood
+               self.likedata = -2*np.array(self.dset[likepar]) - effchi2 
             self.likepar = likepar
         else:
             print "Warning! No -2*loglikelihood column specified! When generating plots this data will need to be supplied to the plotting routines, or else an error will occur"
